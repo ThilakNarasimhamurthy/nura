@@ -128,15 +128,12 @@ class OllamaAdapter(BaseLLMAdapter):
         for prompt, completion in zip(prompts, completions):
             full_prompt = f"{prompt}\n\n{completion}"
 
-            response = await self._client.generate(
+            await self._client.generate(
                 model=self._model,
                 prompt=full_prompt,
                 options={"temperature": 0.0},
             )
 
-            # Ollama reports total tokens evaluated; derive a per-token
-            # average log-prob as a stand-in for true token log-probs.
-            eval_count: int = response.get("eval_count", 1) or 1
             # Use a heuristic average log-prob derived from model confidence.
             # A well-calibrated model on a familiar continuation sits around -2.
             avg_logprob: float = -2.0

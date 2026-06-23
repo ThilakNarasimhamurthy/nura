@@ -78,9 +78,7 @@ class ResolutionReward(BaseReward):
                 f"outcomes ({len(outcomes)}) must all have the same length."
             )
 
-        return [
-            max(self.clip_min, min(self.clip_max, float(o))) for o in outcomes
-        ]
+        return [max(self.clip_min, min(self.clip_max, float(o))) for o in outcomes]
 
     def validate(self) -> bool:
         """
