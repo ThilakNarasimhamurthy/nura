@@ -1,0 +1,14 @@
+torch
+transformers
+trl
+peft
+fastapi
+uvicorn
+sqlalchemy
+typer
+rich
+pydantic
+ollama
+pytest
+black
+ruff
