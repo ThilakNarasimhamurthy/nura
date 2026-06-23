@@ -1,0 +1,11 @@
+# Minimal install for CI — only what tests actually import
+ollama
+fastapi
+uvicorn
+sqlalchemy
+typer
+rich
+pydantic
+pytest
+black
+ruff
