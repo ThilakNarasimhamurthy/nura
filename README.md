@@ -2,6 +2,10 @@
 
 **Your data. Your model. Gets smarter every day.**
 
+Connect your data. Train with RL. Ship an API that improves itself automatically.
+
+---
+
 Nura is an open-source Python SDK that lets any company connect their data, train a custom AI model using reinforcement learning, and get a managed API that improves automatically from real-world outcomes — no ML team required.
 
 [![CI](https://github.com/ThilakNarasimhamurthy/nura/actions/workflows/ci.yml/badge.svg)](https://github.com/ThilakNarasimhamurthy/nura/actions/workflows/ci.yml)
