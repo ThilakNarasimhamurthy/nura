@@ -196,13 +196,17 @@ class NuraTrainer:
         data:
             List of dicts produced by ``NuraDataLoader.prepare()``.
         reward_fn:
-            A :class:`~nura.rewards.base.BaseReward` instance used to score
-            the generated completions against the dataset's outcome signals.
+            Retained for API compatibility; not used internally.
+            Scoring is done by the same heuristic the GRPO loop uses
+            (> 50 words **and** contains a resolution keyword → 1.0),
+            so before/after scores measure actual generation quality rather
+            than the dataset's pre-labelled outcome distribution.
 
         Returns
         -------
         float
-            Mean reward across all samples in ``[0.0, 1.0]``.
+            Mean heuristic reward across all generated completions in
+            ``[0.0, 1.0]``.
         """
         import torch
 
@@ -213,7 +217,6 @@ class NuraTrainer:
             )
 
         prompts = [r["prompt"] for r in data]
-        outcomes = [r["outcome_signal"] for r in data]
         completions: list[str] = []
 
         self._model.eval()
@@ -238,7 +241,9 @@ class NuraTrainer:
                     self._tokenizer.decode(new_ids, skip_special_tokens=True)
                 )
 
-        scores = reward_fn.score(prompts, completions, outcomes)
+        # Score the actual generated text, not the dataset labels.
+        # reward_fn is retained in the signature for API compatibility.
+        scores = _heuristic_reward(completions)
         return sum(scores) / len(scores) if scores else 0.0
 
     # ------------------------------------------------------------------
