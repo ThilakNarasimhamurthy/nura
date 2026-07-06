@@ -90,7 +90,6 @@ class NuraDataLoader:
 
             ds = load_dataset(
                 "bitext/Bitext-customer-support-llm-chatbot-training-dataset",
-                trust_remote_code=True,
             )
             self._raw = [dict(row) for row in ds["train"]]
 
