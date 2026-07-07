@@ -14,6 +14,21 @@ Nura is an open-source Python SDK that lets any company connect their data, trai
 
 ---
 
+## Real results
+
+Tested on the [Bitext Customer Support dataset](https://huggingface.co/datasets/bitext/Bitext-customer-support-llm-chatbot-training-dataset) (26,872 real interactions):
+
+| | Score |
+|---|---|
+| Before training | 31% |
+| After 20 GRPO steps | **33% (+6.5%)** |
+
+Model: `Qwen/Qwen2.5-0.5B-Instruct` · Hardware: Apple Silicon (MPS) · Steps: 20
+
+> 20 steps is a short run. 100+ steps on GPU compounds this significantly.
+
+---
+
 ## Why Nura?
 
 Most AI fine-tuning tools are built for researchers. Nura is built for businesses.
@@ -119,8 +134,10 @@ explanation = await brain.explain_result(before_score=0.61, after_score=0.74, me
 ## Roadmap
 
 - [x] Core SDK: adapters, rewards, brain
-- [ ] GRPO training loop
-- [ ] Data connectors (CSV, Intercom, Zendesk, SQL)
+- [x] GRPO training loop (LoRA fine-tuning via TRL)
+- [x] Data connectors (CSV, JSONL, HuggingFace datasets)
+- [x] `nura train` CLI
+- [ ] More data connectors (Intercom, Zendesk, SQL)
 - [ ] Model registry
 - [ ] FastAPI serving layer
 - [ ] Dashboard (Next.js)
