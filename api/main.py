@@ -14,7 +14,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .db import OutcomeRecord, get_db, init_db
+from .db import OutcomeRecord, RetrainHistory, get_db, init_db
+from .retrain import (
+    bump_next_retrain_at,
+    get_next_retrain_at,
+    retrain_lock,
+    trigger_retrain,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,16 +31,32 @@ logger = logging.getLogger(__name__)
 _model_cache: dict[str, Any] = {}
 
 _BASE_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
-_ADAPTER_PATH = os.getenv("ADAPTER_PATH", "")  # empty → use base model only
+_ADAPTER_PATH = os.getenv("ADAPTER_PATH", "")
+
+
+def _resolve_adapter_path() -> str:
+    """
+    Resolve the adapter to load.
+
+    Precedence:
+    1. ``ADAPTER_PATH`` env var (explicit override)
+    2. ``./adapters/latest`` symlink (updated after each auto-retrain)
+    3. Empty string → base model only
+    """
+    if _ADAPTER_PATH:
+        return _ADAPTER_PATH
+    latest = "./adapters/latest"
+    if os.path.islink(latest) and os.path.exists(latest):
+        return latest
+    return ""
 
 
 def _load_model() -> tuple[Any, Any]:
     """
     Load (or return cached) model + tokenizer.
 
-    Applies the LoRA adapter from ``ADAPTER_PATH`` when the env var is set.
-    Falls back to the raw base model otherwise so the API stays usable
-    without a trained adapter.
+    Checks ``./adapters/latest`` so the hot-swapped adapter is picked up
+    on the next server restart without any manual intervention.
 
     Returns
     -------
@@ -55,11 +77,12 @@ def _load_model() -> tuple[Any, Any]:
 
     model = AutoModelForCausalLM.from_pretrained(_BASE_MODEL, device_map=device)
 
-    if _ADAPTER_PATH:
+    adapter_path = _resolve_adapter_path()
+    if adapter_path:
         from peft import PeftModel
 
-        logger.info("Applying LoRA adapter from %s", _ADAPTER_PATH)
-        model = PeftModel.from_pretrained(model, _ADAPTER_PATH)
+        logger.info("Applying LoRA adapter from %s", adapter_path)
+        model = PeftModel.from_pretrained(model, adapter_path)
         model = model.merge_and_unload()
 
     model.eval()
@@ -69,25 +92,10 @@ def _load_model() -> tuple[Any, Any]:
 
 
 def _generate(prompt: str, max_new_tokens: int = 200) -> str:
-    """
-    Run a single greedy-decode generation pass.
-
-    Parameters
-    ----------
-    prompt:
-        Raw text prompt.
-    max_new_tokens:
-        Maximum tokens to generate.
-
-    Returns
-    -------
-    str
-        The generated text (excluding the input prompt).
-    """
+    """Run a single greedy-decode generation pass."""
     import torch
 
     model, tokenizer = _load_model()
-
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
@@ -147,15 +155,11 @@ DbDep = Annotated[Session, Depends(get_db)]
 
 
 class ChatMessage(BaseModel):
-    """A single turn in a conversation."""
-
     role: str
     content: str
 
 
 class ChatRequest(BaseModel):
-    """OpenAI-compatible chat completion request body."""
-
     model: str = _BASE_MODEL
     messages: list[ChatMessage] = Field(..., min_length=1)
 
@@ -167,16 +171,12 @@ class ChatChoice(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    """OpenAI-compatible chat completion response."""
-
     id: str = "chatcmpl-nura"
     object: str = "chat.completion"
     choices: list[ChatChoice]
 
 
 class OutcomeRequest(BaseModel):
-    """Body for recording a real-world outcome against a prior response."""
-
     prompt: str
     response: str
     outcome_signal: float = Field(..., ge=0.0, le=1.0)
@@ -185,6 +185,12 @@ class OutcomeRequest(BaseModel):
 class OutcomeResponse(BaseModel):
     saved: bool
     total_count: int
+    retrain_triggered: bool
+
+
+class RetrainHistoryItem(BaseModel):
+    triggered_at: datetime
+    improvement_pct: float | None
 
 
 class MetricsResponse(BaseModel):
@@ -195,6 +201,17 @@ class MetricsResponse(BaseModel):
     before_score: float
     after_score: float
     brain_recommendation: str
+    retrain_status: str
+    retrain_history: list[RetrainHistoryItem]
+
+
+class RetrainStatusResponse(BaseModel):
+    status: str
+    triggered_at: datetime | None = None
+    before_score: float | None = None
+    after_score: float | None = None
+    improvement_pct: float | None = None
+    outcomes_at_trigger: int | None = None
 
 
 class HealthResponse(BaseModel):
@@ -209,14 +226,11 @@ class HealthResponse(BaseModel):
 @app.post("/v1/chat/completions", response_model=ChatResponse)
 async def chat_completions(body: ChatRequest, db: DbDep) -> ChatResponse:
     """
-    Generate a response to a conversation and persist the prompt/response pair.
+    Generate a response and persist the prompt/response pair.
 
-    Accepts an OpenAI-style messages list.  The last ``user`` message is used
-    as the prompt; all prior turns are prepended as context.
-
-    The LoRA adapter is applied if ``ADAPTER_PATH`` is set in the environment.
+    Accepts an OpenAI-style messages list.  The conversation is formatted
+    into a single prompt; the model generates a completion.
     """
-    # Build a simple prompt from the message list
     prompt_parts = [f"{m.role.capitalize()}: {m.content}" for m in body.messages]
     prompt = "\n".join(prompt_parts) + "\nAssistant:"
 
@@ -226,15 +240,14 @@ async def chat_completions(body: ChatRequest, db: DbDep) -> ChatResponse:
         logger.exception("Generation failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    # Persist prompt + response; outcome_signal is null until /v1/outcomes
-    user_prompt = body.messages[-1].content
-    record = OutcomeRecord(
-        prompt=user_prompt,
-        response=content,
-        outcome_signal=None,
-        timestamp=datetime.now(timezone.utc),
+    db.add(
+        OutcomeRecord(
+            prompt=body.messages[-1].content,
+            response=content,
+            outcome_signal=None,
+            timestamp=datetime.now(timezone.utc),
+        )
     )
-    db.add(record)
 
     return ChatResponse(
         choices=[ChatChoice(message=ChatMessage(role="assistant", content=content))]
@@ -244,12 +257,12 @@ async def chat_completions(body: ChatRequest, db: DbDep) -> ChatResponse:
 @app.post("/v1/outcomes", response_model=OutcomeResponse)
 def record_outcome(body: OutcomeRequest, db: DbDep) -> OutcomeResponse:
     """
-    Attach a real-world outcome signal to a prior prompt/response pair.
+    Attach a real-world outcome to a prior prompt/response pair.
 
-    If a matching record exists (same prompt + response), its
-    ``outcome_signal`` is updated.  Otherwise a new record is inserted
-    so the training pipeline still captures the signal.
+    Automatically triggers a background retrain when the labelled-outcome
+    count crosses ``next_retrain_at`` and no retrain is already in progress.
     """
+    # Upsert outcome signal
     existing = db.execute(
         select(OutcomeRecord)
         .where(OutcomeRecord.prompt == body.prompt)
@@ -270,8 +283,33 @@ def record_outcome(body: OutcomeRequest, db: DbDep) -> OutcomeResponse:
             )
         )
 
-    total: int = db.execute(select(func.count(OutcomeRecord.id))).scalar_one()
-    return OutcomeResponse(saved=True, total_count=total)
+    db.flush()  # write without committing so we can count accurately
+
+    total: int = db.execute(
+        select(func.count(OutcomeRecord.id)).where(
+            OutcomeRecord.outcome_signal.is_not(None)
+        )
+    ).scalar_one()
+
+    # ── Auto-retrain check ────────────────────────────────────────────────
+    next_retrain = get_next_retrain_at(db)
+    retrain_triggered = False
+
+    if total >= next_retrain and not retrain_lock.locked():
+        bump_next_retrain_at(db, total)
+        retrain_triggered = True
+        trigger_retrain(db)
+        logger.info(
+            "Auto-retrain triggered at %d outcomes (threshold was %d)",
+            total,
+            next_retrain,
+        )
+
+    return OutcomeResponse(
+        saved=True,
+        total_count=total,
+        retrain_triggered=retrain_triggered,
+    )
 
 
 @app.get("/v1/metrics", response_model=MetricsResponse)
@@ -279,12 +317,12 @@ def get_metrics(db: DbDep) -> MetricsResponse:
     """
     Return live metrics for the dashboard.
 
-    ``resolution_rate`` is the average ``outcome_signal`` of the most recent
-    200 labelled records.  ``improvement_pct``, ``before_score``, and
-    ``after_score`` reflect the real numbers from our first training run.
+    Scores and improvement numbers come from the most recent completed
+    retrain run; fall back to the first-run hardcoded numbers when no
+    retrain has completed yet.
     """
-    # Latest 200 records that have a labelled outcome
-    recent = (
+    # Labelled outcomes
+    labelled = (
         db.execute(
             select(OutcomeRecord.outcome_signal)
             .where(OutcomeRecord.outcome_signal.is_not(None))
@@ -295,7 +333,7 @@ def get_metrics(db: DbDep) -> MetricsResponse:
         .all()
     )
 
-    resolution_rate = sum(recent) / len(recent) if recent else 0.0
+    resolution_rate = sum(labelled) / len(labelled) if labelled else 0.0
 
     outcomes_count: int = db.execute(
         select(func.count(OutcomeRecord.id)).where(
@@ -303,17 +341,100 @@ def get_metrics(db: DbDep) -> MetricsResponse:
         )
     ).scalar_one()
 
+    next_retrain_at = get_next_retrain_at(db)
+
+    # ── Retrain history ───────────────────────────────────────────────────
+    last_complete = db.execute(
+        select(RetrainHistory)
+        .where(RetrainHistory.status == "complete")
+        .order_by(RetrainHistory.triggered_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+    if last_complete:
+        improvement_pct = last_complete.improvement_pct or 0.0
+        before_score = last_complete.before_score or 0.0
+        after_score = last_complete.after_score or 0.0
+    else:
+        # First-run numbers from our real training run
+        improvement_pct = 6.5
+        before_score = 31.0
+        after_score = 33.0
+
+    # Current retrain status
+    latest_run = db.execute(
+        select(RetrainHistory).order_by(RetrainHistory.triggered_at.desc()).limit(1)
+    ).scalar_one_or_none()
+
+    if latest_run:
+        retrain_status = latest_run.status
+    elif retrain_lock.locked():
+        retrain_status = "running"
+    else:
+        retrain_status = "idle"
+
+    # Last 5 completed runs for the history list
+    history_rows = (
+        db.execute(
+            select(RetrainHistory)
+            .where(RetrainHistory.status == "complete")
+            .order_by(RetrainHistory.triggered_at.desc())
+            .limit(5)
+        )
+        .scalars()
+        .all()
+    )
+    retrain_history = [
+        RetrainHistoryItem(
+            triggered_at=row.triggered_at,
+            improvement_pct=row.improvement_pct,
+        )
+        for row in history_rows
+    ]
+
+    brain_recommendation = (
+        last_complete
+        and f"Last retrain improved resolution rate by {last_complete.improvement_pct:.1f}%. "
+        "Collect more labelled outcomes to keep the loop running."
+    ) or (
+        "Your model is learning. Collect 500 more labelled outcomes "
+        "then run another training cycle to compound the improvement."
+    )
+
     return MetricsResponse(
         resolution_rate=round(resolution_rate, 4),
         outcomes_count=outcomes_count,
-        next_retrain_at=outcomes_count + 500,
-        improvement_pct=6.5,
-        before_score=31.0,
-        after_score=33.0,
-        brain_recommendation=(
-            "Your model is learning. Collect 500 more labelled outcomes "
-            "then run another training cycle to compound the improvement."
-        ),
+        next_retrain_at=next_retrain_at,
+        improvement_pct=improvement_pct,
+        before_score=before_score,
+        after_score=after_score,
+        brain_recommendation=brain_recommendation,
+        retrain_status=retrain_status,
+        retrain_history=retrain_history,
+    )
+
+
+@app.get("/v1/retrain/status", response_model=RetrainStatusResponse)
+def retrain_status(db: DbDep) -> RetrainStatusResponse:
+    """
+    Return the most recent retrain job's status.
+
+    Returns ``{"status": "idle"}`` when no job has ever run.
+    """
+    latest = db.execute(
+        select(RetrainHistory).order_by(RetrainHistory.triggered_at.desc()).limit(1)
+    ).scalar_one_or_none()
+
+    if latest is None:
+        return RetrainStatusResponse(status="idle")
+
+    return RetrainStatusResponse(
+        status=latest.status,
+        triggered_at=latest.triggered_at,
+        before_score=latest.before_score,
+        after_score=latest.after_score,
+        improvement_pct=latest.improvement_pct,
+        outcomes_at_trigger=latest.outcomes_at_trigger,
     )
 
 

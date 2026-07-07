@@ -41,6 +41,43 @@ class OutcomeRecord(Base):
     )
 
 
+class RetrainHistory(Base):
+    """
+    One record per automated retraining run.
+
+    ``status`` transitions: ``"running"`` → ``"complete"`` | ``"failed"``.
+    """
+
+    __tablename__ = "retrain_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    triggered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    outcomes_at_trigger: Mapped[int] = mapped_column(Integer, nullable=False)
+    before_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    after_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    improvement_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="running"
+    )  # "running" | "complete" | "failed"
+
+
+class AppSettings(Base):
+    """
+    Simple key-value settings table so state survives server restarts.
+
+    Currently used to persist ``next_retrain_at``.
+    """
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[str] = mapped_column(String, nullable=False)
+
+
 def init_db() -> None:
     """Create all tables if they do not already exist."""
     Base.metadata.create_all(bind=engine)
