@@ -174,11 +174,15 @@ class ChatResponse(BaseModel):
     id: str = "chatcmpl-nura"
     object: str = "chat.completion"
     choices: list[ChatChoice]
+    record_id: int | None = (
+        None  # DB row ID — pass to /v1/outcomes to tag this interaction
+    )
 
 
 class OutcomeRequest(BaseModel):
-    prompt: str
-    response: str
+    record_id: int | None = None  # preferred: tag exact interaction
+    prompt: str = ""  # fallback when record_id is absent
+    response: str = ""  # fallback when record_id is absent
     outcome_signal: float = Field(..., ge=0.0, le=1.0)
 
 
@@ -240,17 +244,19 @@ async def chat_completions(body: ChatRequest, db: DbDep) -> ChatResponse:
         logger.exception("Generation failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    db.add(
-        OutcomeRecord(
-            prompt=body.messages[-1].content,
-            response=content,
-            outcome_signal=None,
-            timestamp=datetime.now(timezone.utc),
-        )
+    record = OutcomeRecord(
+        prompt=body.messages[-1].content,
+        response=content,
+        outcome_signal=None,
+        timestamp=datetime.now(timezone.utc),
     )
+    db.add(record)
+    db.flush()  # assigns record.id without closing the transaction
 
     return ChatResponse(
-        choices=[ChatChoice(message=ChatMessage(role="assistant", content=content))]
+        id=f"chatcmpl-nura-{record.id}",
+        choices=[ChatChoice(message=ChatMessage(role="assistant", content=content))],
+        record_id=record.id,
     )
 
 
@@ -262,18 +268,17 @@ def record_outcome(body: OutcomeRequest, db: DbDep) -> OutcomeResponse:
     Automatically triggers a background retrain when the labelled-outcome
     count crosses ``next_retrain_at`` and no retrain is already in progress.
     """
-    # Upsert outcome signal
-    existing = db.execute(
-        select(OutcomeRecord)
-        .where(OutcomeRecord.prompt == body.prompt)
-        .where(OutcomeRecord.response == body.response)
-        .order_by(OutcomeRecord.timestamp.desc())
-        .limit(1)
-    ).scalar_one_or_none()
-
-    if existing is not None:
+    if body.record_id is not None:
+        # Preferred path: tag the exact interaction by DB row ID
+        existing = db.get(OutcomeRecord, body.record_id)
+        if existing is None:
+            raise HTTPException(
+                status_code=404, detail=f"record_id {body.record_id} not found"
+            )
         existing.outcome_signal = body.outcome_signal
     else:
+        # Fallback: always insert a new record — never deduplicate by text,
+        # since two identical conversations are still two distinct interactions.
         db.add(
             OutcomeRecord(
                 prompt=body.prompt,
