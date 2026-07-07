@@ -18,6 +18,14 @@ app = typer.Typer(
 console = Console()
 
 
+@app.command("version")
+def version() -> None:
+    """Show the Nura SDK version."""
+    from . import __version__
+
+    console.print(f"nura {__version__}")
+
+
 @app.command("train")
 def train(
     data: str = typer.Option(..., "--data", help="'bitext', a .jsonl, or a .csv path"),
