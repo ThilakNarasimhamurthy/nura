@@ -68,7 +68,7 @@ class NuraTrainer:
         ==================  =====================  =======================
         Key                 Type                   Default
         ==================  =====================  =======================
-        ``base_model``      ``str``                ``"facebook/opt-125m"``
+        ``base_model``      ``str``                ``"Qwen/Qwen2.5-0.5B-Instruct"``
         ``output_dir``      ``str``                **required**
         ``num_steps``       ``int``                ``20``
         ``batch_size``      ``int``                ``2``
@@ -88,7 +88,7 @@ class NuraTrainer:
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
-        self.base_model: str = config.get("base_model", "facebook/opt-125m")
+        self.base_model: str = config.get("base_model", "Qwen/Qwen2.5-0.5B-Instruct")
         self.output_dir: str = config["output_dir"]
         self.num_steps: int = int(config.get("num_steps", 20))
         self.batch_size: int = int(config.get("batch_size", 2))

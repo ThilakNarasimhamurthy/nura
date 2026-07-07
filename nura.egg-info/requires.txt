@@ -1,0 +1,17 @@
+torch
+transformers
+trl
+peft
+fastapi
+uvicorn
+typer
+rich
+pydantic
+ollama
+datasets
+sqlalchemy
+
+[dev]
+pytest
+ruff
+mypy
